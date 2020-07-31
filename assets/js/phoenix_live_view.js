@@ -388,6 +388,11 @@ export class Rendered {
  *         }
  *       }
  *     }
+ * @param {Function} [opts.handleBeforeUnload] - The optional function to provide a callback handling beforeunload
+ * event from window. it requires returning boolean. false will signal liveview not to set unloaded flag.
+ *
+ *     (event) => {event.preventDefault(); e.returnValue = ''; return false}
+
 */
 export class LiveSocket {
   constructor(url, phxSocket, opts = {}){
@@ -421,14 +426,25 @@ export class LiveSocket {
     this.loaderTimeout = opts.loaderTimeout || LOADER_TIMEOUT
     this.boundTopLevelEvents = false
     this.domCallbacks = opts.dom || {onBeforeElUpdated: closure()}
-    window.addEventListener("unload", e => {
-      this.unloaded = true
-    })
+    this.handleBeforeUnload = opts.handleBeforeUnload || (() => true)
+
     this.socket.onOpen(() => {
       if(this.isUnloaded()){
         // reload page if being restored from back/forward cache and browser does not emit "pageshow"
         window.location.reload()
       }
+      this.unloaded = false
+    })
+    // we need to use beforeunload becasue in Firefox, websocket close event is emitted earlier than window unload
+    // event. Without setting unloaded flag here, displayError will invoked during redirect
+    window.addEventListener("beforeunload", e => {
+      if (this.handleBeforeUnload(e)) {
+        this.unloaded = true
+      }
+    })
+
+    window.addEventListener("unload", e => {
+      this.unloaded = true
     })
   }
 
@@ -1214,12 +1230,16 @@ export let DOM = {
     }
   },
 
+  hasSelectionRange(el) {
+    return el.setSelectionRange && (el.type === "text" || el.type === "textarea")
+  },
+
   restoreFocus(focused, selectionStart, selectionEnd){
     if(!DOM.isTextualInput(focused)){ return }
     let wasFocused = focused.matches(":focus")
     if(focused.readOnly){ focused.blur() }
     if(!wasFocused){ focused.focus() }
-    if(focused.setSelectionRange && focused.type === "text" || focused.type === "textarea"){
+    if(this.hasSelectionRange(focused)){
       focused.setSelectionRange(selectionStart, selectionEnd)
     }
   },
@@ -1334,11 +1354,15 @@ class DOMAppendPrependUpdate {
 
 class DOMPatch {
   static patchEl(fromEl, toEl, activeElement){
-    if(activeElement && activeElement.isSameNode(fromEl)){
-      DOM.mergeFocusedInput(fromEl, toEl)
-    } else {
-      morphdom(fromEl, toEl, {childrenOnly: false})
-    }
+    morphdom(fromEl, toEl, {
+      childrenOnly: false,
+      onBeforeElUpdated: (fromEl, toEl) => {
+        if(activeElement && activeElement.isSameNode(fromEl) && DOM.isFormInput(fromEl)){
+          DOM.mergeFocusedInput(fromEl, toEl)
+          return false
+        }
+      }
+    })
   }
 
   constructor(view, container, id, html, targetCID){
@@ -1379,7 +1403,7 @@ class DOMPatch {
     if(this.isCIDPatch() && !targetContainer){ return }
 
     let focused = liveSocket.getActiveElement()
-    let {selectionStart, selectionEnd} = focused && DOM.isTextualInput(focused) ? focused : {}
+    let {selectionStart, selectionEnd} = focused && DOM.hasSelectionRange(focused) ? focused : {}
     let phxUpdate = liveSocket.binding(PHX_UPDATE)
     let phxFeedbackFor = liveSocket.binding(PHX_FEEDBACK_FOR)
     let disableWith = liveSocket.binding(PHX_DISABLE_WITH)
